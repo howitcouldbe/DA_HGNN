@@ -19,8 +19,9 @@ class DA_HGNN(nn.Module):
     def forward(self,X):
         X,E,H = self.net_SingleHGCN(X)  #单层超图卷积网络
         X = torch.cat([att(X,E,H) for att in self.attentions], dim=1)  # 将每个head得到的表示进行拼接
-        print('==========')
+        # print('X',X[:5,:5])
         X_tilde = self.net_DA_HGAN_2(X,E,H)
+        # print('X', X_tilde[:5, :5])
         return X_tilde
 
 class SingleHGCN(nn.Module):
@@ -86,7 +87,7 @@ class DA_HGAN(nn.Module):
     def forward(self,X,E,H):
         return self.DA_HGAN(X,E,H)
 
-    def DA_HGAN(self,X,E,H):
+    def DA_HGAN(self,Xi,Ek,H):
         '''
         :param X:低维节点特征嵌入 shape:nxd
         :param E:超边特征嵌入     shape:mxd
@@ -96,23 +97,21 @@ class DA_HGAN(nn.Module):
         密度感知超图注意网络主要由两部分组成：密度感知注意顶点聚合和密度感知注意超边聚合。
         '''
 
-        rho_xi = self.node_density(X,H,self.sigma)  #节点密度
-        print('rho_xi',rho_xi[:10])
+        rho_xi = self.node_density(Xi,H,self.sigma)  #节点密度
         rho_hyper_edge = self.hyper_edge_density(rho_xi,H)  #超边密度
-        print('rho_hyper_edge', rho_hyper_edge[:10])
-        a_x_tilde = self.attention(X,E,rho_xi,node=True)    #节点的注意力值，node为true表示计算的是节点注意力值
-        print('a_x_tilde',a_x_tilde[:5,:5])
-        a_hyper_tilde = self.attention(E,X,rho_hyper_edge,node=False)   #超边的注意力值
-        print('a_hyper_tilde', a_hyper_tilde[:5, :5])
-        COE_X = self.coef(a_x_tilde,H)  #节点注意力系数矩阵
-        print('COE_X', COE_X[:5, :5])
-        COE_Edge = self.coef(a_hyper_tilde,H)   #超边注意力系数矩阵
-        print('COE_Edge', COE_Edge[:5, :5])
+        E = self.attention(Xi,Ek,rho_xi,node=True,H=H,X=Xi)    #节点的注意力值，node为true表示计算的是节点注意力值
+        # print('a_x_tilde',a_x_tilde[:5,:5])
+        X = self.attention(Ek,Xi,rho_hyper_edge,node=False,H=H,X=E)   #超边的注意力值
+        # print('a_hyper_tilde', a_hyper_tilde[:5, :5])
+        # COE_X = self.coef(a_x_tilde,H)  #节点注意力系数矩阵
+        # print('COE_X', COE_X[:5, :5])
+        # COE_Edge = self.coef(a_hyper_tilde,H)   #超边注意力系数矩阵
+        # print('COE_Edge', COE_Edge[:5, :5])
+        #
+        # E_tilde = self.feature_concat(COE_X,X)
+        # X_tilde = self.hyper_edge_concat(COE_Edge,E_tilde)
 
-        E_tilde = self.feature_concat(COE_X,X)
-        X_tilde = self.hyper_edge_concat(COE_Edge,E_tilde)
-
-        return X_tilde
+        return X
 
     #通过余弦相似度计算密度
     def node_density(self,X,H,sigma):
@@ -132,7 +131,7 @@ class DA_HGAN(nn.Module):
         rho=torch.tensor(rho,device=torch.device('cuda:0')).reshape(-1,1)
         return rho
     #计算节点与边的注意力值,然后计算标准化密度，最后得出注意力权重
-    def attention(self,Xi:torch.Tensor,Ek:torch.Tensor,rho:torch.Tensor,node:bool):
+    def attention(self,Xi:torch.Tensor,Ek:torch.Tensor,rho:torch.Tensor,node:bool,H,X):
         '''
         :param Xi:节点嵌入矩阵
         :param Ek: 超边嵌入矩阵
@@ -161,26 +160,35 @@ class DA_HGAN(nn.Module):
         #         a_x.append(value)    #将所有的xi与ek的注意力值存入a_x
         # # self.alpha_x.retain_grad()
         # a_x = torch.tensor(a_x,device=torch.device('cuda:0')).reshape(Xi.shape[0],-1)     #获得节点x_i和超边e_k之间的注意力值a_x_e
-
         rho_tilde =torch.tensor([enum/torch.max(rho)*torch.max(a_x) for enum in rho],
                                 device=torch.device('cuda:0')).reshape(-1,1)
         a_x_tilde = a_x+rho_tilde
-        return a_x_tilde
-    def coef(self,a_x_tilde:torch.Tensor,H:torch.Tensor):
-        '''
-        返回注意力系数矩阵
-        :param a_x_tilde:   注意力权重矩阵
-        :param H:   超图关联矩阵
-        :return:    注意力系数矩阵
-        '''
-        return torch.exp(a_x_tilde)/torch.sum(torch.exp(H*a_x_tilde)-(torch.ones_like(H)-H),dim=0)
-    def feature_concat(self,coe_x:torch.Tensor,X:torch.Tensor):
-        '''
-        :param coe_x: 注意力系数矩阵
-        :param X: 数据特征向量
-        :return:特征聚合结果
-        '''
-        return self.net_ELU(torch.mm(coe_x.T,torch.mm(X,self.W)))
+        zero_vec = -1e12 * torch.ones_like(a_x_tilde)  # 将没有连接的边置为负无穷
+        attention = torch.where(H > 0, a_x_tilde, zero_vec)  # [N, N]
+        # 表示如果邻接矩阵元素大于0时，则两个节点有连接，该位置的注意力系数保留，
+        # 否则需要mask并置为非常小的值，原因是softmax的时候这个最小值会不考虑。
+        attention = F.softmax(attention, dim=1)  # softmax形状保持不变 [N, N]，得到归一化的注意力权重！
+        attention = F.dropout(attention, 0.2, training=self.training)  # dropout，防止过拟合
+        if node:
+            h_prime = self.net_ELU(torch.matmul(attention, torch.mm(X,self.W)))  # [N, N].[N, out_features] => [N, out_features]
+        else:
+            h_prime = self.net_ELU(torch.matmul(attention, X))  # [N, N].[N, out_features] => [N, out_features]
+        return h_prime
+    # def coef(self,a_x_tilde:torch.Tensor,H:torch.Tensor):
+    #     '''
+    #     返回注意力系数矩阵
+    #     :param a_x_tilde:   注意力权重矩阵
+    #     :param H:   超图关联矩阵
+    #     :return:    注意力系数矩阵
+    #     '''
+    #     return torch.exp(a_x_tilde)/torch.sum(torch.exp(H*a_x_tilde)-(torch.ones_like(H)-H),dim=0)
+    # def feature_concat(self,coe_x:torch.Tensor,X:torch.Tensor):
+    #     '''
+    #     :param coe_x: 注意力系数矩阵
+    #     :param X: 数据特征向量
+    #     :return:特征聚合结果
+    #     '''
+    #     return self.net_ELU(torch.mm(coe_x.T,))
     def hyper_edge_density(self,rho_x:torch.Tensor,H:torch.Tensor):
         '''
         计算超边密度
