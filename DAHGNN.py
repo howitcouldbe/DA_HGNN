@@ -7,20 +7,21 @@ from d2l import torch as d2l
 from torch.utils import data
 
 class DA_HGNN(nn.Module):
-    def __init__(self,top_k,num_feature,sigma):
+    def __init__(self,top_k,num_feature,sigma,multi_head):
         super(DA_HGNN, self).__init__()
+        self.multi_head = multi_head
+        self.attentions = [DA_HGAN(in_features=256,sigma=sigma,multi_head=multi_head) for _ in
+                           range(multi_head)]   #多头注意力
+        for i, attention in enumerate(self.attentions):
+            self.add_module('attention_{}'.format(i), attention)
         self.net_SingleHGCN = SingleHGCN(top_k=top_k, num_feature=num_feature)
-        self.net_DA_HGAN_1 = DA_HGAN(sigma=sigma)
-        # self.net_DA_HGAN_2 = DA_HGAN(sigma=sigma)
+        self.net_DA_HGAN_2 = DA_HGAN(sigma=sigma,in_features=256)
     def forward(self,X):
         X,E,H = self.net_SingleHGCN(X)  #单层超图卷积网络
-        X_tilde_1 = self.net_DA_HGAN_1(X,E,H)   #密度感知超图注意网络
-        # X_tilde_2 = self.net_DA_HGAN(X, E, H)
-        # X_tilde_3 = self.net_DA_HGAN(X, E, H)
-        # X_tilde_4 = self.net_DA_HGAN(X, E, H)
-        # X_tilde = torch.cat([X_tilde_1,X_tilde_2,X_tilde_3,X_tilde_4],dim=0)
-        # X_tilde = self.net_DA_HGAN_2(X_tilde_1,E,H)
-        return X_tilde_1
+        X = torch.cat([att(X,E,H) for att in self.attentions], dim=1)  # 将每个head得到的表示进行拼接
+        print('==========')
+        X_tilde = self.net_DA_HGAN_2(X,E,H)
+        return X_tilde
 
 class SingleHGCN(nn.Module):
     def __init__(self,top_k,num_feature):
@@ -29,7 +30,7 @@ class SingleHGCN(nn.Module):
             torch.normal(0, 0.01, size=(num_feature,256), requires_grad=True,device=torch.device('cuda:0')))
         self.top_k = top_k+1
     def forward(self,X):
-        X = torch.tensor(X, device=torch.device('cuda:0')).reshape(-1, 784)
+        X = torch.tensor(X, device=torch.device('cuda:0')).reshape(256, -1)
         H = self.euclideanDistance(X)
         X,E = self.singleHGCN(X,H)
         return (X,E,H)
@@ -66,20 +67,20 @@ class SingleHGCN(nn.Module):
         return X,E
 
 class DA_HGAN(nn.Module):
-    def __init__(self,sigma,alpha=0.2):
+    def __init__(self,sigma,in_features,alpha=0.2,multi_head=1):
         '''
         :param sigma: 相似度的阈值
         :param alpha: LeakyRelu的参数，默认0.2
         '''
         super(DA_HGAN, self).__init__()
+        self.W = Parameter(
+            torch.zeros(size=(in_features, int(256 / multi_head)),requires_grad=True, device=torch.device('cuda:0')))
+        self.alpha_x = Parameter(
+            torch.zeros(size=(2 * int(256 / multi_head), 1), requires_grad=True, device=torch.device('cuda:0')))
+        self.alpha_e = Parameter(
+            torch.zeros(size=(2 * int(256 / multi_head), 1), requires_grad=True, device=torch.device('cuda:0')))
         self.sigma = sigma
         self.net_ELU = nn.ELU()
-        self.W = Parameter(
-            torch.normal(0, 0.01, size=(256, 256), device=torch.device('cuda:0')))
-        self.alpha_x = Parameter(
-            torch.normal(0, 0.01, size=(2 * 256, 1), requires_grad=True, device=torch.device('cuda:0')))
-        self.alpha_e = Parameter(
-            torch.normal(0, 0.01, size=(2 * 256, 1), requires_grad=True, device=torch.device('cuda:0')))
         self.leakyrelu = nn.LeakyReLU(alpha)
         
     def forward(self,X,E,H):
@@ -96,16 +97,21 @@ class DA_HGAN(nn.Module):
         '''
 
         rho_xi = self.node_density(X,H,self.sigma)  #节点密度
+        print('rho_xi',rho_xi[:10])
         rho_hyper_edge = self.hyper_edge_density(rho_xi,H)  #超边密度
-
+        print('rho_hyper_edge', rho_hyper_edge[:10])
         a_x_tilde = self.attention(X,E,rho_xi,node=True)    #节点的注意力值，node为true表示计算的是节点注意力值
+        print('a_x_tilde',a_x_tilde[:5,:5])
         a_hyper_tilde = self.attention(E,X,rho_hyper_edge,node=False)   #超边的注意力值
-
+        print('a_hyper_tilde', a_hyper_tilde[:5, :5])
         COE_X = self.coef(a_x_tilde,H)  #节点注意力系数矩阵
+        print('COE_X', COE_X[:5, :5])
         COE_Edge = self.coef(a_hyper_tilde,H)   #超边注意力系数矩阵
+        print('COE_Edge', COE_Edge[:5, :5])
 
         E_tilde = self.feature_concat(COE_X,X)
         X_tilde = self.hyper_edge_concat(COE_Edge,E_tilde)
+
         return X_tilde
 
     #通过余弦相似度计算密度
@@ -134,10 +140,9 @@ class DA_HGAN(nn.Module):
         :return:注意力权重
         '''
         # 将WX和WE拼接
-        WX = torch.mm(Xi, self.W)  # h.shape: (N, in_features), Wh.shape: (N, out_features)
-        WE = torch.mm(Ek, self.W)
+
         a_input = self._prepare_attentional_mechanism_input(
-            WX, WE)  # 实现论文中的特征拼接操作 Wh_i||Wh_j ，得到一个shape = (N ， N, 2 * out_features)的新特征矩阵
+            Xi, Ek)  # 实现论文中的特征拼接操作 Wh_i||Wh_j ，得到一个shape = (N ， N, 2 * out_features)的新特征矩阵
         if node:
             a_x = self.leakyrelu(torch.matmul(a_input, self.alpha_x).squeeze(2))
         else:
@@ -188,7 +193,10 @@ class DA_HGAN(nn.Module):
     def hyper_edge_concat(self,COE_Edge,E_tilde):
         return self.net_ELU(torch.mm(COE_Edge.T,E_tilde))
 
-    def _prepare_attentional_mechanism_input(self, WX,WE):
+    def _prepare_attentional_mechanism_input(self, Xi,Ek):
+
+        WX = torch.mm(Xi, self.W)  # h.shape: (N, in_features), Wh.shape: (N, out_features)
+        WE = torch.mm(Ek, self.W)
         N = WX.size()[0]  # number of nodes
         # Below, two matrices are created that contain embeddings in their rows in different orders.
         # (e stands for embedding)
@@ -233,6 +241,7 @@ class DA_HGAN(nn.Module):
         all_combinations_matrix = torch.cat([WX_repeated_in_chunks, WE_repeated_alternating], dim=1)
         # all_combinations_matrix.shape == (N * N, 2 * out_features)
 
+
         return all_combinations_matrix.view(N, N, 2 * self.W.shape[1])
 
 
@@ -265,9 +274,9 @@ import torch.nn.functional as F
 #
 #         self.leakyrelu = nn.LeakyReLU(self.alpha)
 #
-#     def forward(self, X, E):
-#         WX = torch.mm(X, self.W)  # h.shape: (N, in_features), Wh.shape: (N, out_features)
-#         WE = torch.mm(E,self.W)
+#     def forward(self, Xi,Ek,W):
+#         WX = torch.mm(Xi, self.W)  # h.shape: (N, in_features), Wh.shape: (N, out_features)
+#         WE = torch.mm(Ek,self.W)
 #         a_input = self._prepare_attentional_mechanism_input(
 #             WX,WE)  # 实现论文中的特征拼接操作 Wh_i||Wh_j ，得到一个shape = (N ， N, 2 * out_features)的新特征矩阵
 #         e = self.leakyrelu(torch.matmul(a_input, self.a).squeeze(2))
@@ -342,9 +351,9 @@ def load_data_fashion_mnist(batch_size,resize=None):
         trans.insert(0,transforms.Resize(resize))
     trans =transforms.Compose(trans)
     mnist_train = torchvision.datasets.FashionMNIST(
-        root="data",train=True,transform=trans,download=True)
+        root="../data",train=True,transform=trans,download=True)
     mnist_test =torchvision.datasets.FashionMNIST(
-        root='data',train=False,transform=trans,download=True
+        root='../data',train=False,transform=trans,download=True
     )
     return (data.DataLoader(mnist_train,batch_size,shuffle=True,num_workers=0),
             (data.DataLoader(mnist_test,batch_size,shuffle=False,num_workers=0)))
