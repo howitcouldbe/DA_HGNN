@@ -20,8 +20,6 @@ def evaluate_accuracy_gpu(net,data_iter,device=None):
         break
     return metric[0]/metric[1]
 
-
-# def train(net,train_iter,test_iter,num_epochs,lr,device):
 def train(net,train_iter,test_iter,num_epochs,lr,device):
     def init_weights(m):
         if  type(m) == DA_HGNN:
@@ -34,7 +32,6 @@ def train(net,train_iter,test_iter,num_epochs,lr,device):
     net.to(device)
     optimizer = torch.optim.Adam(net.parameters(),lr=lr)
     loss = nn.CrossEntropyLoss()
-    # num_batches = len(train_iter)
     for epoch in range(num_epochs):
         # print("=============更新之前===========")
         # temp = 0  # 控制打印的参数个数
@@ -47,7 +44,6 @@ def train(net,train_iter,test_iter,num_epochs,lr,device):
         metric = d2l.Accumulator(3)
         net.train()
         for i,(X,y) in enumerate(train_iter):
-            print(f'batch {i}')
             optimizer.zero_grad()
             X, y = X.to('cuda:0'), y.to('cuda:0')
             # y = y.to(torch.long)
@@ -76,20 +72,9 @@ net = nn.Sequential(DA_HGNN(top_k=10,num_feature=784,sigma=0.4,multi_head=4),
                     nn.Linear(256,10),nn.Softmax()
                     )
 net.to(device=torch.device('cuda:0'))
-# for (X,y) in train_iter:
-#
-train(net,train_iter,test_iter,num_epochs=2000,lr=0.002,device='cuda:0')
-    # train(net, X,y, test_iter, num_epochs=2000, lr=0.002, device='cuda:0')
 
-# net = nn.Sequential(DA_HGNN(top_k=10,num_feature=784,batch_size=128,sigma=0.4),
-#                     nn.Linear(256,10),
-#                     nn.Softmax(dim=1)
-#                     )
-# net.to(device=torch.device('cuda:0'))
-# for i,(X,y) in enumerate(train_iter):
-#
-#     print(net(X)[:10,:10])
-#     break
+train(net,train_iter,test_iter,num_epochs=2000,lr=0.001,device='cuda:0')
+
 
 
 

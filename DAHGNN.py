@@ -1,10 +1,10 @@
-import torch
 import torchvision.datasets
-from torch import nn
 from torch.nn.parameter import Parameter
 from torchvision import transforms
-from d2l import torch as d2l
 from torch.utils import data
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 class DA_HGNN(nn.Module):
     def __init__(self,top_k,num_feature,sigma,multi_head):
@@ -31,7 +31,7 @@ class SingleHGCN(nn.Module):
             torch.normal(0, 0.01, size=(num_feature,256), requires_grad=True,device=torch.device('cuda:0')))
         self.top_k = top_k+1
     def forward(self,X):
-        X = torch.tensor(X, device=torch.device('cuda:0')).reshape(256, -1)
+        X = torch.tensor(X, device=torch.device('cuda:0')).reshape(-1, 784)
         H = self.euclideanDistance(X)
         X,E = self.singleHGCN(X,H)
         return (X,E,H)
@@ -41,13 +41,11 @@ class SingleHGCN(nn.Module):
         A = torch.sum(X**2,dim=1).reshape(1,-1)
         B = torch.sum(X**2,dim=1).reshape(-1,1)
         C = torch.mm(X,X.T)
-
         dist_matric = torch.abs(A+B-2*C)
-
         values, indices = torch.topk(dist_matric, k=self.top_k, dim=1, largest=False)
         H = torch.zeros_like(dist_matric,device=torch.device('cuda:0'))
         for i, indice in zip(range(dist_matric.shape[0]), indices):
-            H[i, indice] = 1.0
+            H[indice, i] = 1.0
         return H
     #单层卷积操作
     def singleHGCN(self,X,H):
@@ -100,35 +98,24 @@ class DA_HGAN(nn.Module):
         rho_xi = self.node_density(Xi,H,self.sigma)  #节点密度
         rho_hyper_edge = self.hyper_edge_density(rho_xi,H)  #超边密度
         E = self.attention(Xi,Ek,rho_xi,node=True,H=H,X=Xi)    #节点的注意力值，node为true表示计算的是节点注意力值
-        # print('a_x_tilde',a_x_tilde[:5,:5])
         X = self.attention(Ek,Xi,rho_hyper_edge,node=False,H=H,X=E)   #超边的注意力值
-        # print('a_hyper_tilde', a_hyper_tilde[:5, :5])
-        # COE_X = self.coef(a_x_tilde,H)  #节点注意力系数矩阵
-        # print('COE_X', COE_X[:5, :5])
-        # COE_Edge = self.coef(a_hyper_tilde,H)   #超边注意力系数矩阵
-        # print('COE_Edge', COE_Edge[:5, :5])
-        #
-        # E_tilde = self.feature_concat(COE_X,X)
-        # X_tilde = self.hyper_edge_concat(COE_Edge,E_tilde)
 
         return X
 
     #通过余弦相似度计算密度
-    def node_density(self,X,H,sigma):
-        rho = []  # 密度
-        cos_sim = nn.CosineSimilarity(dim=0, eps=1e-6)
-        for i,(line1,x_i) in enumerate(zip(H,X)):
-            sim_sum = 0
-            for j,(line2,x_j) in enumerate(zip(H,X)):
-                if i != j:
-                    if (line1 * line2).sum() >0:
-                        sim = cos_sim(x_i, x_j)
-                        if sim > sigma:
-                            sim_sum += sim
-                        else:
-                            sim_sum += 0
-            rho.append(sim_sum)
-        rho=torch.tensor(rho,device=torch.device('cuda:0')).reshape(-1,1)
+    def node_density(self,X,H,sigma:float):
+        neiji = torch.mm(X, X.T)    #内积
+        mochang = torch.sqrt(torch.sum(X * X, dim=1).reshape(1, -1) * (torch.sum(X * X, dim=1).reshape(-1, 1))) #模长
+        cosim = neiji/mochang   #余弦相似度矩阵
+
+        #矩阵元素小于sigma的全部置为0，对角线元素也置0，因为不需要自己和自己的相似度
+        cosim = torch.where(cosim>sigma,cosim,torch.zeros_like(cosim))\
+                *(torch.ones_like(cosim,device='cuda:0')-torch.eye(cosim.shape[0],device='cuda:0'))
+        #节点和超边的关系矩阵H的内积的每一行，可以表示每个节点的所有相邻节点
+        xx = torch.where(torch.mm(H,H.T) > 0, float(1), float(0)) \
+             * (torch.ones_like(cosim,device='cuda:0') - torch.eye(cosim.shape[0],device='cuda:0'))
+        #将每个节点与相邻节点的相似度相加，就是该节点的密度
+        rho = torch.sum(cosim*xx,dim=1).reshape(-1,1)
         return rho
     #计算节点与边的注意力值,然后计算标准化密度，最后得出注意力权重
     def attention(self,Xi:torch.Tensor,Ek:torch.Tensor,rho:torch.Tensor,node:bool,H,X):
@@ -174,21 +161,7 @@ class DA_HGAN(nn.Module):
         else:
             h_prime = self.net_ELU(torch.matmul(attention, X))  # [N, N].[N, out_features] => [N, out_features]
         return h_prime
-    # def coef(self,a_x_tilde:torch.Tensor,H:torch.Tensor):
-    #     '''
-    #     返回注意力系数矩阵
-    #     :param a_x_tilde:   注意力权重矩阵
-    #     :param H:   超图关联矩阵
-    #     :return:    注意力系数矩阵
-    #     '''
-    #     return torch.exp(a_x_tilde)/torch.sum(torch.exp(H*a_x_tilde)-(torch.ones_like(H)-H),dim=0)
-    # def feature_concat(self,coe_x:torch.Tensor,X:torch.Tensor):
-    #     '''
-    #     :param coe_x: 注意力系数矩阵
-    #     :param X: 数据特征向量
-    #     :return:特征聚合结果
-    #     '''
-    #     return self.net_ELU(torch.mm(coe_x.T,))
+
     def hyper_edge_density(self,rho_x:torch.Tensor,H:torch.Tensor):
         '''
         计算超边密度
@@ -252,107 +225,6 @@ class DA_HGAN(nn.Module):
 
         return all_combinations_matrix.view(N, N, 2 * self.W.shape[1])
 
-
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-
-
-# class GraphAttentionLayer(nn.Module):
-#     """
-#     Simple GAT layer, similar to https://arxiv.org/abs/1710.10903
-#     """
-#
-#     def __init__(self, in_features, out_features, dropout, alpha, concat=True):
-#         super(GraphAttentionLayer, self).__init__()
-#         self.dropout = dropout
-#         self.in_features = in_features
-#         self.out_features = out_features
-#         self.alpha = alpha
-#         self.concat = concat
-#
-#         self.W = nn.Parameter(
-#             torch.empty(size=(in_features, out_features)))  # empty（）创建任意数据类型的张量，torch.tensor（）只创建torch.FloatTensor类型的张量
-#         nn.init.xavier_uniform_(self.W.data,
-#                                 gain=1.414)  # orch.nn.init.xavier_uniform_是一个服从均匀分布的Glorot初始化器,参见：Glorot, X. & Bengio, Y. (2010). Understanding the difficulty of training deep feedforward neural networks.
-#         self.a = nn.Parameter(torch.empty(size=(2 * out_features, 1)))  # 遵从原文，a是shape为(2×F',1)的张量
-#         nn.init.xavier_uniform_(self.a.data, gain=1.414)
-#
-#         self.leakyrelu = nn.LeakyReLU(self.alpha)
-#
-#     def forward(self, Xi,Ek,W):
-#         WX = torch.mm(Xi, self.W)  # h.shape: (N, in_features), Wh.shape: (N, out_features)
-#         WE = torch.mm(Ek,self.W)
-#         a_input = self._prepare_attentional_mechanism_input(
-#             WX,WE)  # 实现论文中的特征拼接操作 Wh_i||Wh_j ，得到一个shape = (N ， N, 2 * out_features)的新特征矩阵
-#         e = self.leakyrelu(torch.matmul(a_input, self.a).squeeze(2))
-#         # torch.matmul(a_input, self.a)的shape=(N,N,1)，经过squeeze(2)后，shape变为(N,N)
-#
-#         zero_vec = -9e15 * torch.ones_like(e)
-#         attention = torch.where(E > 0, e, zero_vec)  # np.where(condition, x, y),满足条件(condition)，输出x，不满足输出y.
-#         attention = F.softmax(attention, dim=1)  # 对每一行内的数据做归一化
-#         attention = F.dropout(attention, self.dropout, training=self.training)
-#         h_prime = torch.matmul(attention, Wh)  # 当输入是都是二维时，就是普通的矩阵乘法，和tensor.mm函数用法相同
-#         # h_prime.shape=(N,out_features)
-#
-#         if self.concat:
-#             return F.elu(h_prime)
-#         else:
-#             return h_prime
-#
-#     def _prepare_attentional_mechanism_input(self, WX,WE):
-#         N = WX.size()[0]  # number of nodes
-#         # Below, two matrices are created that contain embeddings in their rows in different orders.
-#         # (e stands for embedding)
-#         # These are the rows of the first matrix (Wh_repeated_in_chunks):
-#         # e1, e1, ..., e1,            e2, e2, ..., e2,            ..., eN, eN, ..., eN
-#         # '-------------' -> N times  '-------------' -> N times       '-------------' -> N times
-#         #
-#         # These are the rows of the second matrix (Wh_repeated_alternating):
-#         # e1, e2, ..., eN, e1, e2, ..., eN, ..., e1, e2, ..., eN
-#         # '----------------------------------------------------' -> N times
-#         #
-#         WX_repeated_in_chunks = WX.repeat_interleave(N, dim=0)
-#         # repeat_interleave(self: Tensor, repeats: _int, dim: Optional[_int]=None)
-#         # 参数说明：
-#         # self: 传入的数据为tensor
-#         # repeats: 复制的份数
-#         # dim: 要复制的维度，可设定为0/1/2.....
-#         WE_repeated_alternating = WE.repeat(N, 1)
-#         # repeat方法可以对 Wh 张量中的单维度和非单维度进行复制操作，并且会真正的复制数据保存到内存中
-#         # repeat(N, 1)表示dim=0维度的数据复制N份，dim=1维度的数据保持不变
-#
-#         # Wh_repeated_in_chunks.shape == Wh_repeated_alternating.shape == (N * N, out_features)
-#
-#         # The all_combination_matrix, created below, will look like this (|| denotes concatenation):
-#         # e1 || e1
-#         # e1 || e2
-#         # e1 || e3
-#         # ...
-#         # e1 || eN
-#         # e2 || e1
-#         # e2 || e2
-#         # e2 || e3
-#         # ...
-#         # e2 || eN
-#         # ...
-#         # eN || e1
-#         # eN || e2
-#         # eN || e3
-#         # ...
-#         # eN || eN
-#
-#         all_combinations_matrix = torch.cat([WX_repeated_in_chunks, WE_repeated_alternating], dim=1)
-#         # all_combinations_matrix.shape == (N * N, 2 * out_features)
-#
-#         return all_combinations_matrix.view(N, N, 2 * self.out_features)
-#
-#     def __repr__(self):
-#         return self.__class__.__name__ + ' (' + str(self.in_features) + ' -> ' + str(self.out_features) + ')'
-
-
 def load_data_fashion_mnist(batch_size,resize=None):
     trans = [transforms.ToTensor()]
     if resize:
@@ -365,9 +237,6 @@ def load_data_fashion_mnist(batch_size,resize=None):
     )
     return (data.DataLoader(mnist_train,batch_size,shuffle=True,num_workers=0),
             (data.DataLoader(mnist_test,batch_size,shuffle=False,num_workers=0)))
-
-
-
 
 
 
